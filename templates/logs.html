@@ -1,0 +1,57 @@
+{% extends "base.html" %}
+{% block title %}Logs{% endblock %}
+{% block page_title %}Logs{% endblock %}
+{% block page_subtitle %}Server Activity Logs{% endblock %}
+{% block content %}
+<div class="stats-grid">
+  <div class="stat-card"><div class="stat-icon">⚠️</div><div class="stat-value">{{ stats.total }}</div><div class="stat-label">Warnings</div></div>
+  <div class="stat-card"><div class="stat-icon">🔨</div><div class="stat-value">{{ stats.bans }}</div><div class="stat-label">Bans</div></div>
+  <div class="stat-card"><div class="stat-icon">👢</div><div class="stat-value">{{ stats.kicks }}</div><div class="stat-label">Kicks</div></div>
+  <div class="stat-card"><div class="stat-icon">⏰</div><div class="stat-value">{{ stats.timeouts }}</div><div class="stat-label">Timeouts</div></div>
+</div>
+
+<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:20px;flex-wrap:wrap;gap:12px">
+  <div style="display:flex;gap:8px;flex-wrap:wrap">
+    {% for t in log_types %}
+    <a href="/logs?type={{ t }}" class="btn {% if current_type == t %}btn-gold{% else %}btn-blue{% endif %}" style="font-size:11px;padding:6px 14px;letter-spacing:1px">
+      {% if t == 'all' %}📋{% elif t == 'moderation' %}🛡️{% elif t == 'ticket' %}🎫{% elif t == 'member' %}👤{% elif t == 'message' %}✉️{% elif t == 'order' %}📦{% elif t == 'automod' %}🤖{% elif t == 'voice' %}🎙️{% else %}📁{% endif %}
+      {{ t }}
+    </a>
+    {% endfor %}
+  </div>
+  <form method="POST" action="/clear_logs" onsubmit="return confirm('Delete all logs?')">
+    <button class="btn btn-danger" type="submit" style="padding:6px 16px">🗑️ Clear All</button>
+  </form>
+</div>
+
+<div class="section">
+  <div class="section-header"><div class="section-title">📜 Activity</div></div>
+  <div class="table-wrap">
+    <div class="table-row header" style="grid-template-columns:90px 1.2fr 2fr 110px">
+      <div>Type</div><div>Event</div><div>Details</div><div>Time</div>
+    </div>
+    {% if logs %}
+      {% for l in logs %}
+      <div class="table-row" style="grid-template-columns:90px 1.2fr 2fr 110px">
+        <div>
+          <span class="badge badge-{{ l.type }}">
+            {% if l.type == 'moderation' %}🛡️{% elif l.type == 'ticket' %}🎫{% elif l.type == 'member' %}👤{% elif l.type == 'message' %}✉️{% elif l.type == 'order' %}📦{% elif l.type == 'automod' %}🤖{% elif l.type == 'voice' %}🎙️{% else %}📁{% endif %}
+            {{ l.type }}
+          </span>
+        </div>
+        <div style="font-size:13px;font-weight:600;color:var(--text)">{{ l.title }}</div>
+        <div style="font-size:11px;color:var(--text-dim);line-height:1.5">{{ l.description[:120] }}{% if l.description|length > 120 %}...{% endif %}</div>
+        <div style="font-size:10px;color:var(--text-dim)">{{ l.time }}</div>
+      </div>
+      {% endfor %}
+    {% else %}
+      <div class="empty-state" style="padding:40px">📭 NO LOGS{% if current_type != 'all' %} — Type: <strong>{{ current_type }}</strong>{% endif %}</div>
+    {% endif %}
+  </div>
+  {% if logs %}
+  <div style="margin-top:12px;font-size:11px;letter-spacing:1px;color:var(--text-dim);text-align:right">
+    Showing <span style="color:var(--gold)">{{ logs|length }}</span> entries{% if current_type != 'all' %} — filtered by <span style="color:var(--gold)">{{ current_type }}</span>{% endif %}
+  </div>
+  {% endif %}
+</div>
+{% endblock %}
