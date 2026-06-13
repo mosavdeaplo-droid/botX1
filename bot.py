@@ -1062,102 +1062,62 @@ async def order(ctx,
 #  ██  VOICE RELAY COMMANDS (ENHANCED)
 # ═══════════════════════════════════════════════════════════════
 
-@bot.slash_command(guild_ids=[GUILD_ID], name="join", description="Make the bot join a voice channel")
-@has_security_role()
-async def join_voice(ctx,
-                     channel: Option(discord.VoiceChannel, "Select the voice channel to join", required=True)):
-    guild = ctx.guild
-    # Disconnect from existing session if any
-    if guild.voice_client and guild.voice_client.is_connected():
-        old_channel = guild.voice_client.channel.name
-        # Save call history
-        sess = voice_session.get(guild.id, {})
-        if sess.get("start"):
-            start_dt = datetime.fromisoformat(sess["start"])
-            end_dt   = datetime.now(timezone.utc)
-            duration_secs = int((end_dt - start_dt).total_seconds())
-            db["voice_calls"].insert_one({
-                "guild_id":    guild.id,
-                "channel":     old_channel,
-                "channel_id":  sess.get("channel_id"),
-                "started_by":  sess.get("started_by"),
-                "start":       start_dt,
-                "end":         end_dt,
-                "duration":    duration_secs,
-            })
-        await guild.voice_client.disconnect()
-    try:
-        vc = await channel.connect()
-    except Exception as e:
-        await ctx.respond(f"❌ Failed to join channel: {e}", ephemeral=True)
-        return
-    source = MicAudioSource()
-    vc.play(source, after=lambda e: None)
-    start_time = datetime.now(timezone.utc).isoformat()
-    voice_session[guild.id] = {
-        "channel":    channel.name,
-        "channel_id": channel.id,
-        "start":      start_time,
-        "started_by": ctx.author.id,
-        "started_by_name": ctx.author.name,
-    }
-    await _ws_broadcast({
-        "type":       "joined",
-        "channel":    channel.name,
-        "channel_id": channel.id,
-        "start":      start_time,
-        "started_by": ctx.author.name,
-        "members":    [m.name for m in channel.members if not m.bot],
-    })
-    embed = discord.Embed(
-        title="🎙️ Voice Relay Active",
-        description=(
-            f"**Channel:** {channel.mention}\n"
-            f"**Started by:** {ctx.author.mention}\n\n"
-            "The bot is now in the voice channel.\n"
-            "Use `/leave` to disconnect.\n"
-            "Use the **Dashboard → Voice Relay** to speak."
-        ),
-        color=0x2ECC71,
-        timestamp=datetime.now(timezone.utc),
-    )
-    embed.set_footer(text=current_footer())
-    await ctx.respond(embed=embed)
-    await send_log(guild, "🎙️ Voice Relay Started",
-                   f"**Channel:** {channel.name}\n**By:** {ctx.author.mention}",
-                   color=0x2ECC71)
-
-
 @bot.slash_command(guild_ids=[GUILD_ID], name="leave", description="Disconnect the bot from voice")
 @has_security_role()
 async def leave_voice(ctx):
     guild = ctx.guild
-    if not guild.voice_client or not guild.voice_client.is_connected():
-        await ctx.respond("❌ Not in a voice channel.", ephemeral=True)
+
+    await ctx.defer(ephemeral=True)
+
+    if not guild.voice_client:
+        voice_session.pop(guild.id, None)
+        await _ws_broadcast({"type": "left", "channel": "Unknown"})
+        await ctx.followup.send("🔇 Bot is not in any voice channel.", ephemeral=True)
         return
-    channel_name = guild.voice_client.channel.name
+
+    channel_name = getattr(guild.voice_client.channel, "name", "Unknown")
     sess = voice_session.get(guild.id, {})
+
     if sess.get("start"):
-        start_dt = datetime.fromisoformat(sess["start"])
-        end_dt   = datetime.now(timezone.utc)
-        duration_secs = int((end_dt - start_dt).total_seconds())
-        db["voice_calls"].insert_one({
-            "guild_id":    guild.id,
-            "channel":     channel_name,
-            "channel_id":  sess.get("channel_id"),
-            "started_by":  sess.get("started_by"),
-            "started_by_name": sess.get("started_by_name", "Unknown"),
-            "start":       start_dt,
-            "end":         end_dt,
-            "duration":    duration_secs,
-        })
-    await guild.voice_client.disconnect()
+        try:
+            start_dt = datetime.fromisoformat(sess["start"])
+            end_dt = datetime.now(timezone.utc)
+            duration_secs = int((end_dt - start_dt).total_seconds())
+            db["voice_calls"].insert_one({
+                "guild_id": guild.id,
+                "channel": channel_name,
+                "channel_id": sess.get("channel_id"),
+                "started_by": sess.get("started_by"),
+                "started_by_name": sess.get("started_by_name", "Unknown"),
+                "start": start_dt,
+                "end": end_dt,
+                "duration": duration_secs,
+            })
+        except Exception:
+            pass
+
+    try:
+        if guild.voice_client.is_playing():
+            guild.voice_client.stop()
+    except Exception:
+        pass
+
+    try:
+        await guild.voice_client.disconnect(force=True)
+    except Exception:
+        pass
+
     voice_session.pop(guild.id, None)
     await _ws_broadcast({"type": "left", "channel": channel_name})
-    await ctx.respond(f"✅ Disconnected from **{channel_name}**.")
-    await send_log(guild, "🔇 Voice Relay Ended",
-                   f"**Channel:** {channel_name}\n**By:** {ctx.author.mention}",
-                   color=0xE74C3C)
+
+    await ctx.followup.send(f"✅ Disconnected from **{channel_name}**.", ephemeral=True)
+
+    await send_log(
+        guild,
+        "🔇 Voice Relay Ended",
+        f"**Channel:** {channel_name}\n**By:** {ctx.author.mention}",
+        color=0xE74C3C,
+    )
 
 
 @bot.slash_command(guild_ids=[GUILD_ID], name="voice_status", description="Check voice relay status")
