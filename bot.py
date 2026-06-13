@@ -158,10 +158,19 @@ def current_embed_color() -> int:
         return EMBED_COLOR
 
 
+def _clean_role_map(raw: dict, fallback: dict) -> dict:
+    cleaned = {}
+    for label, role_id in (raw or {}).items():
+        value = int_value(role_id, 0)
+        if value:
+            cleaned[str(label)] = value
+    return cleaned or fallback
+
+
 def get_role_maps() -> tuple[dict, dict]:
     cfg = cfg_doc("roles_config")
-    language = cfg.get("language_roles") or LANGUAGE_ROLES
-    games = cfg.get("game_roles") or GAME_ROLES
+    language = _clean_role_map(cfg.get("language_roles"), LANGUAGE_ROLES)
+    games = _clean_role_map(cfg.get("game_roles"), GAME_ROLES)
     return language, games
 
 # ─────────────────────────────────────────
@@ -623,10 +632,27 @@ class GameRoleButton(Button):
 async def on_ready():
     global ws_server_task
     print(f"✅ Logged in as {bot.user} ({bot.user.id})")
-    bot.add_view(TicketView())
-    bot.add_view(TicketControlView())
-    bot.add_view(LanguageRoleView())
-    bot.add_view(GameRoleView())
+
+    # Persistent views must never be allowed to crash startup.
+    for view_factory in (TicketView, TicketControlView, LanguageRoleView, GameRoleView):
+        try:
+            bot.add_view(view_factory())
+        except Exception as e:
+            print(f"⚠️ Failed to register persistent view {view_factory.__name__}: {e}", flush=True)
+
+    # Force slash-command sync so /join, /leave and /voice_status reappear after deploys.
+    try:
+        await bot.sync_commands(guild_ids=[GUILD_ID])
+        print(f"✅ Slash commands synced for guild {GUILD_ID}", flush=True)
+    except TypeError:
+        try:
+            await bot.sync_commands()
+            print("✅ Slash commands synced globally", flush=True)
+        except Exception as e:
+            print(f"⚠️ Slash command sync failed: {e}", flush=True)
+    except Exception as e:
+        print(f"⚠️ Slash command sync failed: {e}", flush=True)
+
     if ws_server_task is None or ws_server_task.done():
         ws_server_task = asyncio.create_task(start_ws_server())
 
@@ -1062,20 +1088,191 @@ async def order(ctx,
 #  ██  VOICE RELAY COMMANDS (ENHANCED)
 # ═══════════════════════════════════════════════════════════════
 
+@bot.slash_command(guild_ids=[GUILD_ID], name="join", description="Make the bot join a voice channel")
+@has_security_role()
+async def join_voice(ctx,
+                     channel: Option(discord.VoiceChannel, "Select the voice channel to join", required=True)):
+    guild = ctx.guild
+
+    deferred = False
+    try:
+        await ctx.defer(ephemeral=True)
+        deferred = True
+    except Exception:
+        deferred = False
+
+    async def reply(message=None, *, embed=None):
+        try:
+            if deferred:
+                await ctx.followup.send(message, embed=embed, ephemeral=True)
+            else:
+                await ctx.respond(message, embed=embed, ephemeral=True)
+        except Exception:
+            pass
+
+    async def save_current_voice_history(channel_name: str):
+        sess = voice_session.get(guild.id, {})
+        if not sess.get("start"):
+            return
+        try:
+            start_dt = datetime.fromisoformat(sess["start"])
+            end_dt = datetime.now(timezone.utc)
+            duration_secs = int((end_dt - start_dt).total_seconds())
+            db["voice_calls"].insert_one({
+                "guild_id": guild.id,
+                "channel": channel_name,
+                "channel_id": sess.get("channel_id"),
+                "started_by": sess.get("started_by"),
+                "started_by_name": sess.get("started_by_name", "Unknown"),
+                "start": start_dt,
+                "end": end_dt,
+                "duration": duration_secs,
+            })
+        except Exception as e:
+            print(f"⚠️ Failed to save voice history: {e}", flush=True)
+
+    # Clean any old/stale voice client before joining. This fixes the
+    # Already connected / Not connected to voice loop after Railway restarts.
+    if guild.voice_client:
+        old_channel = getattr(getattr(guild.voice_client, "channel", None), "name", "Unknown")
+        await save_current_voice_history(old_channel)
+        try:
+            if guild.voice_client.is_playing():
+                guild.voice_client.stop()
+        except Exception:
+            pass
+        try:
+            await guild.voice_client.disconnect(force=True)
+        except Exception as e:
+            print(f"⚠️ Failed to disconnect stale voice client: {e}", flush=True)
+        voice_session.pop(guild.id, None)
+        await _ws_broadcast({"type": "left", "channel": old_channel})
+        await asyncio.sleep(2)
+
+    # Connect to the selected voice channel.
+    try:
+        vc = await channel.connect(timeout=30, reconnect=True)
+    except discord.ClientException as e:
+        if "Already connected" in str(e):
+            try:
+                if guild.voice_client:
+                    await guild.voice_client.disconnect(force=True)
+                voice_session.pop(guild.id, None)
+                await asyncio.sleep(2)
+                vc = await channel.connect(timeout=30, reconnect=True)
+            except Exception as retry_error:
+                await reply(f"❌ Failed to join after cleanup: {retry_error}")
+                return
+        else:
+            await reply(f"❌ Failed to join channel: {e}")
+            return
+    except Exception as e:
+        await reply(f"❌ Failed to join channel: {e}")
+        return
+
+    # Wait until Discord voice is actually connected before vc.play().
+    connected = False
+    for _ in range(60):
+        try:
+            if vc and vc.is_connected():
+                connected = True
+                break
+        except Exception:
+            pass
+        await asyncio.sleep(0.5)
+
+    if not connected:
+        try:
+            await vc.disconnect(force=True)
+        except Exception:
+            pass
+        voice_session.pop(guild.id, None)
+        await _ws_broadcast({"type": "left", "channel": channel.name})
+        await reply("❌ Joined visually, but Discord voice connection was not ready. Try /join again.")
+        return
+
+    # Start audio relay only after the voice client is really connected.
+    try:
+        if vc.is_playing():
+            vc.stop()
+        source = MicAudioSource()
+        vc.play(source, after=lambda e: print(f"Voice playback error: {e}", flush=True) if e else None)
+    except Exception as e:
+        try:
+            await vc.disconnect(force=True)
+        except Exception:
+            pass
+        voice_session.pop(guild.id, None)
+        await _ws_broadcast({"type": "left", "channel": channel.name})
+        await reply(f"❌ Voice connected, but failed to start audio relay: {e}")
+        return
+
+    start_time = datetime.now(timezone.utc).isoformat()
+    voice_session[guild.id] = {
+        "channel": channel.name,
+        "channel_id": channel.id,
+        "start": start_time,
+        "started_by": ctx.author.id,
+        "started_by_name": ctx.author.name,
+    }
+
+    await _ws_broadcast({
+        "type": "joined",
+        "channel": channel.name,
+        "channel_id": channel.id,
+        "start": start_time,
+        "started_by": ctx.author.name,
+        "members": [m.name for m in channel.members if not m.bot],
+    })
+
+    embed = discord.Embed(
+        title="🎙️ Voice Relay Active",
+        description=(
+            f"**Channel:** {channel.mention}\n"
+            f"**Started by:** {ctx.author.mention}\n\n"
+            "The bot is now in the voice channel.\n"
+            "Use `/leave` to disconnect.\n"
+            "Use the **Dashboard → Voice Relay** to speak."
+        ),
+        color=0x2ECC71,
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.set_footer(text=current_footer())
+
+    await reply(embed=embed)
+    await send_log(guild, "🎙️ Voice Relay Started",
+                   f"**Channel:** {channel.name}\n**By:** {ctx.author.mention}",
+                   color=0x2ECC71)
+
+
 @bot.slash_command(guild_ids=[GUILD_ID], name="leave", description="Disconnect the bot from voice")
 @has_security_role()
 async def leave_voice(ctx):
     guild = ctx.guild
 
-    await ctx.defer(ephemeral=True)
+    deferred = False
+    try:
+        await ctx.defer(ephemeral=True)
+        deferred = True
+    except Exception:
+        deferred = False
+
+    async def reply(message):
+        try:
+            if deferred:
+                await ctx.followup.send(message, ephemeral=True)
+            else:
+                await ctx.respond(message, ephemeral=True)
+        except Exception:
+            pass
 
     if not guild.voice_client:
         voice_session.pop(guild.id, None)
         await _ws_broadcast({"type": "left", "channel": "Unknown"})
-        await ctx.followup.send("🔇 Bot is not in any voice channel.", ephemeral=True)
+        await reply("🔇 Bot is not in any voice channel.")
         return
 
-    channel_name = getattr(guild.voice_client.channel, "name", "Unknown")
+    channel_name = getattr(getattr(guild.voice_client, "channel", None), "name", "Unknown")
     sess = voice_session.get(guild.id, {})
 
     if sess.get("start"):
@@ -1093,8 +1290,8 @@ async def leave_voice(ctx):
                 "end": end_dt,
                 "duration": duration_secs,
             })
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"⚠️ Failed to save voice history: {e}", flush=True)
 
     try:
         if guild.voice_client.is_playing():
@@ -1104,20 +1301,15 @@ async def leave_voice(ctx):
 
     try:
         await guild.voice_client.disconnect(force=True)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"⚠️ Failed to disconnect voice client: {e}", flush=True)
 
     voice_session.pop(guild.id, None)
     await _ws_broadcast({"type": "left", "channel": channel_name})
-
-    await ctx.followup.send(f"✅ Disconnected from **{channel_name}**.", ephemeral=True)
-
-    await send_log(
-        guild,
-        "🔇 Voice Relay Ended",
-        f"**Channel:** {channel_name}\n**By:** {ctx.author.mention}",
-        color=0xE74C3C,
-    )
+    await reply(f"✅ Disconnected from **{channel_name}**.")
+    await send_log(guild, "🔇 Voice Relay Ended",
+                   f"**Channel:** {channel_name}\n**By:** {ctx.author.mention}",
+                   color=0xE74C3C)
 
 
 @bot.slash_command(guild_ids=[GUILD_ID], name="voice_status", description="Check voice relay status")
